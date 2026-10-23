@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=iPhone Fotos (Hintergrund)
+Comment=Startet iPhone Fotos im Hintergrund und öffnet bei iPhone-Verbindung
+Exec=ios-photos --monitor
+Icon=io.github.ajuenemann.IosPhotos-rosette
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

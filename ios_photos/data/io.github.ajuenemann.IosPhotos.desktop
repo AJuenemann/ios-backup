@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=iPhone Fotos
+GenericName=Foto-Import
+Comment=Fotos und Videos vom iPhone importieren
+Exec=ios-photos
+Icon=io.github.ajuenemann.IosPhotos-rosette
+Terminal=false
+Categories=Graphics;Photography;GTK;
+Keywords=iPhone;iOS;Apple;Fotos;Import;Kamera;Backup;
+StartupNotify=true
+SingleMainWindow=true

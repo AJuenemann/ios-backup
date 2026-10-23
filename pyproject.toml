@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ios-photos"
+version = "1.0.0"
+description = "iPhone-Fotos und -Videos komfortabel importieren – nach dem Vorbild von Apple Fotos"
+requires-python = ">=3.11"
+dependencies = ["pillow", "pillow-heif", "av"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ios-photos = "ios_photos.app:main"
+
+[tool.setuptools.packages.find]
+include = ["ios_photos*"]
+
+[tool.setuptools.package-data]
+ios_photos = ["data/**/*", "ui/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

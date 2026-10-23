@@ -1,0 +1,122 @@
+/* Foto-Raster */
+.photo-grid,
+.photo-grid > row {
+  background: none;
+  padding: 0;
+  margin: 0;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+.photo-grid > row:hover,
+.photo-grid > row:selected,
+.photo-grid > row:focus {
+  background: none;
+}
+
+.thumb-cell {
+  background-color: alpha(currentColor, 0.06);
+  border-radius: 4px;
+}
+.thumb-cell .thumb-picture {
+  border-radius: 4px;
+}
+.thumb-cell.imported .thumb-picture {
+  opacity: 0.45;
+}
+.thumb-cell.selected {
+  outline: 3px solid var(--accent-bg-color, @accent_bg_color);
+  outline-offset: -3px;
+}
+.thumb-cell.selected .thumb-picture {
+  opacity: 0.85;
+}
+
+.thumb-badges {
+  margin: 6px;
+  color: white;
+  font-weight: bold;
+  font-size: 0.85em;
+  -gtk-icon-shadow: 0 0 3px rgba(0, 0, 0, 0.8);
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
+}
+.thumb-tag {
+  font-size: 0.75em;
+  padding: 0 4px;
+  border-radius: 3px;
+  background-color: rgba(0, 0, 0, 0.45);
+  text-shadow: none;
+}
+.thumb-check {
+  margin: 6px;
+  padding: 3px;
+  min-width: 14px;
+  min-height: 14px;
+  border-radius: 999px;
+  color: white;
+  background-color: var(--accent-bg-color, @accent_bg_color);
+  box-shadow: 0 0 0 2px white;
+}
+.thumb-check.imported-check {
+  background-color: rgba(0, 0, 0, 0.55);
+}
+
+.section-big {
+  font-size: 1.45em;
+  font-weight: 800;
+}
+.section-day {
+  font-size: 1.05em;
+  font-weight: 700;
+}
+.section-select {
+  font-weight: normal;
+  font-size: 0.9rem;
+  color: var(--accent-color, @accent_color);
+}
+
+/* Import-Leiste (wie die Kopfzeile in Apple Fotos) */
+.import-bar {
+  padding: 6px 12px;
+  border-bottom: 1px solid alpha(currentColor, 0.12);
+}
+.import-progress {
+  padding: 8px 14px;
+  border-top: 1px solid alpha(currentColor, 0.12);
+}
+
+/* Karten für Jahre/Monate */
+.year-card {
+  border-radius: 14px;
+  min-height: 180px;
+}
+.year-card .card-picture {
+  border-radius: 14px;
+}
+.card-caption {
+  margin: 14px;
+  color: white;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+.card-caption .card-title {
+  font-size: 1.8em;
+  font-weight: 800;
+}
+.card-caption .card-subtitle {
+  font-weight: 600;
+}
+.card-shade {
+  background-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0) 55%);
+  border-radius: 14px;
+}
+
+/* Vorschau */
+.preview-stage {
+  background-color: black;
+}
+.live-button.active {
+  color: var(--accent-color, @accent_color);
+}
+.sidebar-count {
+  font-feature-settings: "tnum";
+}
