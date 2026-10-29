@@ -116,8 +116,9 @@ class Asset:
         return [f for f in self.files if f.ftype != "sidecar"]
 
 
-def build_assets(files, key_prefix=""):
+def build_assets(files, key_prefix="", hidden_rels=None):
     """Gruppiert eine Liste von SourceFile (eines Ordners) zu Assets."""
+    hidden_rels = hidden_rels or set()
     groups = {}
     for f in files:
         stem = os.path.splitext(f.name)[0]
@@ -152,15 +153,21 @@ def build_assets(files, key_prefix=""):
             or any(m.ftype == "sidecar" and m.variant == "" for m in members),
             screenshot=bool(stills) and all(s.name.lower().endswith(".png") for s in stills),
         )
+        a.extra["hidden"] = any(
+            m.ftype != "sidecar" and m.rel.upper() in hidden_rels
+            for m in members
+        )
         assets.append(a)
     return assets
 
 
-def scan_tree(root, skip_dirs=(".ios-photos",), progress=None):
-    """Durchsucht `root` rekursiv (versteckte Ordner werden übersprungen)."""
+def scan_tree(root, skip_dirs=(".ios-photos",), progress=None, hidden_rels=None, cancel=None):
+    """Durchsucht `root` rekursiv (versteckte Ordner werden übersprungen). None bei Abbruch."""
     assets = []
     count = 0
     for dirpath, dirnames, filenames in os.walk(root):
+        if cancel is not None and cancel.is_set():
+            return None
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in skip_dirs)
         files = []
         for name in sorted(filenames):
@@ -177,16 +184,16 @@ def scan_tree(root, skip_dirs=(".ios-photos",), progress=None):
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             files.append(SourceFile(path, rel, name, st.st_size, st.st_mtime, ftype))
         if files:
-            assets.extend(build_assets(files))
+            assets.extend(build_assets(files, hidden_rels=hidden_rels))
             count += len(files)
             if progress:
                 progress(count)
     return assets
 
 
-def scan_dcim(mountpoint, progress=None):
-    """Durchsucht den DCIM-Ordner eines iPhones. Gibt None zurück, wenn DCIM fehlt (gesperrt)."""
+def scan_dcim(mountpoint, progress=None, cancel=None):
+    """Durchsucht den DCIM-Ordner eines iPhones. None, wenn DCIM fehlt (gesperrt) oder abgebrochen."""
     dcim = os.path.join(mountpoint, "DCIM")
     if not os.path.isdir(dcim):
         return None
-    return scan_tree(dcim, progress=progress)
+    return scan_tree(dcim, progress=progress, cancel=cancel)

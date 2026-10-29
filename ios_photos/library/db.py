@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import threading
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from ..media.scanner import Asset, SourceFile, name_key
 
 DB_DIR = ".ios-photos"
 DB_NAME = "library.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+TRASH_DB_BATCH = 50
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -26,7 +28,8 @@ CREATE TABLE IF NOT EXISTS assets (
     imported_at TEXT,
     import_id INTEGER REFERENCES imports(id) ON DELETE SET NULL,
     legacy INTEGER DEFAULT 0,
-    source_udid TEXT
+    source_udid TEXT,
+    hidden INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS assets_taken ON assets(taken_at);
 CREATE TABLE IF NOT EXISTS files (
@@ -68,6 +71,21 @@ def db_path(root):
     return Path(root) / DB_DIR / DB_NAME
 
 
+def _is_fat(path):
+    try:
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            mounts = [line.split()[:3] for line in fh]
+    except OSError:
+        return False
+    path = os.path.realpath(path)
+    best = ("", "")
+    for _dev, mnt, fstype in mounts:
+        mnt = mnt.replace("\\040", " ")
+        if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best[0]):
+            best = (mnt, fstype)
+    return best[1] in ("vfat", "msdos")
+
+
 class Library:
     def __init__(self, root):
         self.root = Path(root)
@@ -75,12 +93,23 @@ class Library:
         (self.root / DB_DIR).mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(db_path(self.root)), check_same_thread=False)
         self.db.execute("PRAGMA foreign_keys = ON")
+        if self.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal" and not _is_fat(self.root):
+            mode = self.db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            if mode != "delete":
+                self.db.close()
+                raise sqlite3.OperationalError("WAL konnte nach dem Mediathek-Umzug nicht deaktiviert werden")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.execute(
             "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
         )
         self.db.commit()
         self._fp = None
+
+    def _migrate(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(assets)")}
+        if "hidden" not in cols:
+            self.db.execute("ALTER TABLE assets ADD COLUMN hidden INTEGER DEFAULT 0")
 
     # ---------------------------------------------------------------- allgemein
     def close(self):
@@ -92,11 +121,17 @@ class Library:
 
     def is_empty(self):
         with self._lock:
-            return self.db.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+            return self.db.execute(
+                "SELECT COUNT(*) FROM assets a WHERE EXISTS ("
+                "SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')"
+            ).fetchone()[0] == 0
 
     def count(self):
         with self._lock:
-            return self.db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            return self.db.execute(
+                "SELECT COUNT(*) FROM assets a WHERE EXISTS ("
+                "SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')"
+            ).fetchone()[0]
 
     def get_meta(self, key, default=None):
         with self._lock:
@@ -150,16 +185,23 @@ class Library:
         """`rels`: {SourceFile: rel_pfad_in_mediathek}. Gibt die Asset-ID zurück."""
         with self._lock:
             existing = asset.extra.get("partial_of")
+            asset_id = None
             if existing:
                 asset_id = existing[0]
-            else:
+                row = self.db.execute("SELECT source_udid FROM assets WHERE id=?", (asset_id,)).fetchone()
+                existing_udid = row[0] if row else None
+                if source_udid and existing_udid != source_udid:
+                    asset_id = None
+            if asset_id is None:
                 cur = self.db.execute(
                     "INSERT INTO assets (kind, raw, screenshot, edited, taken_at, duration, width, height,"
-                    " imported_at, import_id, legacy, source_udid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " imported_at, import_id, legacy, source_udid, hidden)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         asset.kind, int(asset.raw), int(asset.screenshot), int(asset.edited),
                         asset.sort_date.isoformat(), asset.duration, asset.width, asset.height,
                         datetime.now().isoformat(timespec="seconds"), import_id, int(legacy), source_udid,
+                        int(bool(asset.extra.get("hidden"))),
                     ),
                 )
                 asset_id = cur.lastrowid
@@ -183,6 +225,16 @@ class Library:
         with self._lock:
             self.db.commit()
 
+    def enable_wal(self):
+        """Lokaler Index: einzelne dauerhafte Commits ohne Journal-Neuanlage."""
+        with self._lock:
+            self.db.execute("PRAGMA synchronous=FULL")
+            mode = self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if mode.lower() != "wal":
+                raise sqlite3.OperationalError(
+                    f"WAL für die lokale Mediathek nicht verfügbar (Modus: {mode})"
+                )
+
     def move_file(self, file_rel, new_rel, commit=True):
         with self._lock:
             self.db.execute("UPDATE files SET rel=? WHERE rel=?", (new_rel, file_rel))
@@ -200,6 +252,124 @@ class Library:
             self.db.commit()
             self._fp = None
             return len(gone)
+
+    def _trash_folder(self):
+        """Erstellt einen Sammelordner direkt im System-Papierkorb desselben Laufwerks."""
+        from gi.repository import Gio
+
+        folder = Path(tempfile.mkdtemp(prefix="iPhone Fotos - ", dir=self.root.resolve()))
+        try:
+            if not Gio.File.new_for_path(str(folder)).trash(None):
+                raise OSError("Der Sammelordner konnte nicht in den Papierkorb verschoben werden")
+        finally:
+            if folder.exists():
+                folder.rmdir()
+        entries = Gio.File.new_for_uri("trash:///").enumerate_children(
+            "standard::target-uri,trash::orig-path", Gio.FileQueryInfoFlags.NONE, None,
+        )
+        try:
+            for entry in entries:
+                if entry.get_attribute_byte_string("trash::orig-path") != str(folder):
+                    continue
+                uri = entry.get_attribute_string("standard::target-uri")
+                target = Gio.File.new_for_uri(uri).get_path() if uri else None
+                if target:
+                    path = Path(target)
+                    if (not path.is_symlink() and path.is_dir()
+                            and path.stat().st_dev == self.root.stat().st_dev
+                            and not path.resolve().is_relative_to(self.root.resolve())):
+                        return path
+                break
+        finally:
+            entries.close(None)
+        raise OSError("Der Sammelordner im System-Papierkorb ist nicht lokal erreichbar. "
+                      "Es wurden keine Originaldateien verschoben.")
+
+    def trash_assets(self, asset_ids, progress=None, cancel=None):
+        """Verschiebt lokale Dateien in den System-Papierkorb; meldet Teilerfolge."""
+        from gi.repository import Gio, GLib
+
+        completed, errors = 0, []
+        with self._lock:
+            jobs = [
+                (asset_id, self.db.execute(
+                    "SELECT id, rel FROM files WHERE asset_id=?", (asset_id,)
+                ).fetchall())
+                for asset_id in dict.fromkeys(asset_ids)
+            ]
+        total = sum(len(rows) for _, rows in jobs)
+        done = 0
+        root = self.root.resolve()
+        moved = []
+        destination = None
+
+        def save_moved():
+            if not moved:
+                return
+            with self._lock:
+                try:
+                    self.db.execute("BEGIN")
+                    self.db.executemany("DELETE FROM files WHERE id=?", [(fid,) for fid, _ in moved])
+                    self.db.executemany(
+                        "DELETE FROM assets WHERE id=? AND NOT EXISTS"
+                        " (SELECT 1 FROM files WHERE asset_id=?)",
+                        [(asset_id, asset_id) for asset_id in {aid for _, aid in moved}],
+                    )
+                    self.db.commit()
+                except sqlite3.Error:
+                    self.db.rollback()
+                    raise
+                self._fp = None
+                moved.clear()
+
+        for asset_id, rows in jobs:
+            if not rows:
+                continue
+            failed = False
+            asset_moved = False
+            for file_id, rel in rows:
+                if cancel is not None and cancel.is_set() and not asset_moved:
+                    save_moved()
+                    return completed, errors
+                if progress:
+                    progress(done, total, rel)
+                path = self.root / rel
+                try:
+                    resolved = path.resolve()
+                    if (Path(rel).is_absolute() or resolved == root
+                            or not resolved.is_relative_to(root)
+                            or path.is_symlink() or path.is_dir()):
+                        raise OSError("Kein gültiger lokaler Dateipfad innerhalb der Mediathek")
+                    if total > 1:
+                        if destination is None:
+                            try:
+                                destination = self._trash_folder()
+                            except (GLib.Error, OSError) as e:
+                                save_moved()
+                                return completed, errors + [("Papierkorb", str(e))]
+                        target = destination / resolved.relative_to(root)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        path.rename(target)
+                    elif not Gio.File.new_for_path(str(path)).trash(None):
+                        raise OSError("Die Datei konnte nicht in den Papierkorb verschoben werden")
+                except (GLib.Error, OSError) as e:
+                    errors.append((rel, str(e)))
+                    failed = True
+                else:
+                    moved.append((file_id, asset_id))
+                    asset_moved = True
+                    if len(moved) >= TRASH_DB_BATCH:
+                        save_moved()
+                done += 1
+                if progress:
+                    progress(done, total, rel)
+            if cancel is not None and cancel.is_set():
+                save_moved()
+                return completed, errors
+            if not failed:
+                completed += 1
+        save_moved()
+        return completed, errors
 
     # ------------------------------------------------------------- Importe
     def start_import(self, udid, device_name, album_id=None):
@@ -237,8 +407,10 @@ class Library:
     def albums(self):
         with self._lock:
             rows = self.db.execute(
-                "SELECT al.id, al.name, COUNT(aa.asset_id) FROM albums al"
-                " LEFT JOIN album_assets aa ON aa.album_id = al.id GROUP BY al.id ORDER BY al.name"
+                "SELECT al.id, al.name, COUNT(a.id) FROM albums al"
+                " LEFT JOIN album_assets aa ON aa.album_id = al.id"
+                " LEFT JOIN assets a ON a.id = aa.asset_id AND a.hidden = 0"
+                " GROUP BY al.id ORDER BY al.name"
             ).fetchall()
         return [{"id": r[0], "name": r[1], "count": r[2]} for r in rows]
 
@@ -281,10 +453,29 @@ class Library:
             )
             self.db.commit()
 
+    def set_hidden(self, asset_ids, hidden):
+        if not asset_ids:
+            return
+        with self._lock:
+            self.db.executemany(
+                "UPDATE assets SET hidden=? WHERE id=?",
+                [(int(bool(hidden)), a) for a in asset_ids],
+            )
+            self.db.commit()
+
     # ------------------------------------------------------------- Abfragen
-    def query(self, kind=None, raw=None, screenshot=None, album_id=None, import_id=None):
+    def query(self, kind=None, raw=None, screenshot=None, album_id=None, import_id=None,
+              hidden=None):
         """Liefert Asset-Objekte (Status 'imported') aufsteigend nach Aufnahmedatum."""
-        where, args = [], []
+        where, args = ["EXISTS (SELECT 1 FROM files mf WHERE mf.asset_id = a.id AND mf.ftype != 'sidecar')"], []
+        if hidden == "all":
+            pass
+        elif hidden is None:
+            where.append("a.hidden = 0")
+        elif hidden:
+            where.append("a.hidden = 1")
+        else:
+            where.append("a.hidden = 0")
         if kind:
             where.append("a.kind = ?")
             args.append(kind)
@@ -329,11 +520,22 @@ class Library:
         with self._lock:
             q = self.db.execute
             return {
-                "all": q("SELECT COUNT(*) FROM assets").fetchone()[0],
-                "video": q("SELECT COUNT(*) FROM assets WHERE kind='video'").fetchone()[0],
-                "live": q("SELECT COUNT(*) FROM assets WHERE kind='live'").fetchone()[0],
-                "raw": q("SELECT COUNT(*) FROM assets WHERE raw=1").fetchone()[0],
-                "screenshot": q("SELECT COUNT(*) FROM assets WHERE screenshot=1").fetchone()[0],
+                "all": q("SELECT COUNT(*) FROM assets a WHERE hidden=0 AND EXISTS ("
+                         "SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')").fetchone()[0],
+                "video": q("SELECT COUNT(*) FROM assets a WHERE hidden=0 AND kind='video'"
+                           " AND EXISTS (SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')")
+                .fetchone()[0],
+                "live": q("SELECT COUNT(*) FROM assets a WHERE hidden=0 AND kind='live'"
+                          " AND EXISTS (SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')")
+                .fetchone()[0],
+                "raw": q("SELECT COUNT(*) FROM assets a WHERE hidden=0 AND raw=1"
+                         " AND EXISTS (SELECT 1 FROM files f WHERE f.asset_id=a.id AND f.ftype!='sidecar')")
+                .fetchone()[0],
+                "screenshot": q("SELECT COUNT(*) FROM assets a WHERE hidden=0"
+                                " AND screenshot=1 AND EXISTS (SELECT 1 FROM files f WHERE f.asset_id=a.id"
+                                " AND f.ftype!='sidecar')").fetchone()[0],
+                "hidden": q("SELECT COUNT(*) FROM assets a WHERE hidden=1 AND EXISTS (SELECT 1 FROM files f"
+                            " WHERE f.asset_id=a.id AND f.ftype!='sidecar')").fetchone()[0],
             }
 
     def all_rels(self):

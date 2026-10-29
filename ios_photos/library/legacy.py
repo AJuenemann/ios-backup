@@ -48,7 +48,7 @@ def plan_reorganize(library):
     """Ermittelt, welche Dateien außerhalb von JJJJ/MM/TT liegen und wohin sie verschoben würden."""
     plan = ReorgPlan()
     index = _DirIndex(str(library.root))
-    for asset in library.query():
+    for asset in library.query(hidden="all"):
         if all(DATE_DIR_RE.match(f.rel) for f in asset.files):
             continue
         target = date_dir(asset)

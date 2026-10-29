@@ -38,6 +38,7 @@ DEFAULTS = {
     "media_filter": "all",
     "hide_imported": False,
     "last_album": None,
+    "background_monitor": True,
     "devices": {},
 }
 

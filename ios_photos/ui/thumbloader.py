@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 from collections import OrderedDict
 
 from gi.repository import Gdk, GLib
@@ -19,7 +20,7 @@ class ThumbLoader:
         self._mem = OrderedDict()
         self._callbacks = {}
         self._stack = []
-        self._failed = set()
+        self._failed = {}
         self._cond = threading.Condition()
         self._stopped = False
         for i in range(workers):
@@ -41,13 +42,14 @@ class ThumbLoader:
         tex = self.peek(f)
         if tex is not None:
             return tex
-        if f.path in self._failed:
+        if time.monotonic() - self._failed.get(f.path, float("-inf")) < 5:
             GLib.idle_add(callback, None)
             return None
         with self._cond:
+            pending = f.path in self._callbacks
             cbs = self._callbacks.setdefault(f.path, [])
             cbs.append(callback)
-            if len(cbs) == 1:
+            if not pending:
                 self._stack.append(f)
             else:
                 # nach oben holen, damit sichtbare Kacheln zuerst geladen werden
@@ -55,7 +57,8 @@ class ThumbLoader:
                     self._stack.remove(f)
                 except ValueError:
                     pass
-                self._stack.append(f)
+                else:
+                    self._stack.append(f)
             self._cond.notify()
         return None
 
@@ -88,8 +91,9 @@ class ThumbLoader:
         with self._cond:
             cbs = self._callbacks.pop(f.path, [])
         if tex is None:
-            self._failed.add(f.path)
+            self._failed[f.path] = time.monotonic()
         else:
+            self._failed.pop(f.path, None)
             self._mem[f.path] = tex
             self._mem.move_to_end(f.path)
             while len(self._mem) > self.mem_items:

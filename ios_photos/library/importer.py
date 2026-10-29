@@ -3,9 +3,12 @@
 import errno
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
+
+from .db import _is_fat
 
 CHUNK = 4 * 1024 * 1024
 FAT_LIMIT = 4 * 1024 ** 3 - 1
@@ -64,22 +67,70 @@ def plan_names(files, rel_dir, index):
     return {f: _with_suffix(f.name, n) for f in files}
 
 
-def copy_file(src, dst, cancel, on_bytes, mtime=None):
+def copy_file(src, dst, cancel, on_bytes, mtime=None, *, source_waiting=None):
+    incomplete_attempts = 0
+    while True:
+        if cancel.is_set():
+            raise ImportCancelled()
+        try:
+            _copy_file(src, dst, cancel, on_bytes, mtime)
+            return
+        except SourceReadError as e:
+            if isinstance(e, IncompleteSourceError):
+                incomplete_attempts += 1
+                if incomplete_attempts >= 3:
+                    raise
+            if source_waiting is None or e.errno not in (errno.EACCES, errno.EPERM, errno.EIO):
+                raise
+            source_waiting(os.path.basename(src))
+            if cancel.wait(1):
+                raise ImportCancelled()
+
+
+class SourceReadError(OSError):
+    pass
+
+
+class IncompleteSourceError(SourceReadError):
+    pass
+
+
+def _copy_file(src, dst, cancel, on_bytes, mtime):
     part = dst + ".part"
+    copied = 0
     try:
-        with open(src, "rb") as fin, open(part, "wb") as fout:
+        try:
+            expected_size = os.path.getsize(src)
+            fin = open(src, "rb")
+        except OSError as e:
+            raise SourceReadError(e.errno, str(e)) from e
+        with fin, open(part, "wb") as fout:
             while True:
                 if cancel.is_set():
                     raise ImportCancelled()
-                chunk = fin.read(CHUNK)
+                try:
+                    chunk = fin.read(CHUNK)
+                except OSError as e:
+                    raise SourceReadError(e.errno, str(e)) from e
                 if not chunk:
                     break
                 fout.write(chunk)
+                copied += len(chunk)
                 on_bytes(len(chunk))
             fout.flush()
             os.fsync(fout.fileno())
-        if os.path.getsize(part) != os.path.getsize(src):
-            raise OSError(errno.EIO, "Größe stimmt nach dem Kopieren nicht überein")
+        try:
+            source_size = os.path.getsize(src)
+        except OSError as e:
+            raise SourceReadError(e.errno, str(e)) from e
+        actual_size = os.path.getsize(part)
+        if actual_size != source_size or actual_size != expected_size:
+            raise IncompleteSourceError(
+                errno.EIO,
+                f"Unvollständige Übertragung: {actual_size} Bytes kopiert; "
+                f"Quelle vor/nach dem Lesen: {expected_size}/{source_size} Bytes. "
+                "Datei nicht importiert; bitte iPhone entsperren und erneut versuchen.",
+            )
         os.replace(part, dst)
         if mtime:
             try:
@@ -87,6 +138,8 @@ def copy_file(src, dst, cancel, on_bytes, mtime=None):
             except OSError:
                 pass
     except BaseException:
+        if copied:
+            on_bytes(-copied)
         try:
             os.unlink(part)
         except OSError:
@@ -95,16 +148,19 @@ def copy_file(src, dst, cancel, on_bytes, mtime=None):
 
 
 def run_import(library, assets, *, album_id=None, udid=None, device_name=None,
-               cancel=None, progress=None):
+               cancel=None, progress=None, source_waiting=None):
     """Importiert `assets` (bereits mit Status markiert). Läuft im Worker-Thread.
 
     progress(done_items, total_items, done_bytes, total_bytes, current_name)
     """
     cancel = cancel or threading.Event()
     result = ImportResult()
+    original_count = len(assets)
     library.mark_status(assets)
     todo = [a for a in assets if a.status == "new"]
-    result.skipped = len(assets) - len(todo)
+    result.skipped = original_count - len(todo)
+    if not todo and not cancel.is_set():
+        return result
     fps = library.fingerprints()
     jobs = []
     for a in todo:
@@ -127,6 +183,14 @@ def run_import(library, assets, *, album_id=None, udid=None, device_name=None,
             f"frei {free / 1e9:.1f} GB."
         )
         return result
+
+    is_fat = _is_fat(root)
+    if is_fat:
+        try:
+            library.enable_wal()
+        except sqlite3.Error as e:
+            result.fatal = f"Lokaler Mediathek-Index konnte nicht vorbereitet werden: {e}"
+            return result
 
     result.import_id = library.start_import(udid, device_name, album_id)
     index = _DirIndex(root)
@@ -158,10 +222,11 @@ def run_import(library, assets, *, album_id=None, udid=None, device_name=None,
             written = []
             try:
                 for f in files:
-                    if f.size > FAT_LIMIT and _is_fat(root):
+                    if f.size > FAT_LIMIT and is_fat:
                         raise OSError(errno.EFBIG, "Datei größer als 4 GB – auf FAT32 nicht speicherbar")
                     dst = os.path.join(root, rel_dir, names[f])
-                    copy_file(f.path, dst, cancel, on_bytes, f.mtime)
+                    copy_file(f.path, dst, cancel, on_bytes, f.mtime,
+                              source_waiting=source_waiting)
                     index.add(rel_dir, names[f])
                     written.append(f)
             except ImportCancelled:
@@ -170,6 +235,10 @@ def run_import(library, assets, *, album_id=None, udid=None, device_name=None,
             except OSError as e:
                 _cleanup(root, rel_dir, names, written)
                 done_bytes += sum(f.size for f in files if f not in written)
+                if isinstance(e, SourceReadError) and e.errno == errno.ENOENT:
+                    # Auf dem iPhone gelöscht, nachdem die Liste eingelesen wurde.
+                    result.failed.append((asset.primary.name, "nicht mehr auf dem Gerät"))
+                    continue
                 result.failed.append((asset.primary.name, e.strerror or str(e)))
                 consecutive_errors += 1
                 if e.errno in (errno.ENOTCONN, errno.ENODEV, errno.ENOSPC, errno.EROFS) \
@@ -211,18 +280,3 @@ def _fatal_text(e):
     if e.errno == errno.EROFS:
         return "Das Ziellaufwerk ist schreibgeschützt."
     return "Die Verbindung zum iPhone wurde unterbrochen."
-
-
-def _is_fat(path):
-    try:
-        with open("/proc/mounts", encoding="utf-8") as fh:
-            mounts = [line.split()[:3] for line in fh]
-    except OSError:
-        return False
-    path = os.path.realpath(path)
-    best = ("", "")
-    for _dev, mnt, fstype in mounts:
-        mnt = mnt.replace("\\040", " ")
-        if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best[0]):
-            best = (mnt, fstype)
-    return best[1] in ("vfat", "msdos")

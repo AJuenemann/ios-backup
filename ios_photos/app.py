@@ -14,7 +14,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .config import APP_ICON, APP_ID, APP_NAME, Config, autostart_file  # noqa: E402
-from .device.monitor import READY, DeviceMonitor  # noqa: E402
+from .device.monitor import DeviceMonitor  # noqa: E402
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -75,6 +75,7 @@ class Application(Adw.Application):
         self.add_action(quit_action)
         self.set_accels_for_action("app.quit", ["<Control>q"])
         self.set_accels_for_action("window.close", ["<Control>w"])
+        self.set_autostart(self.config.get("background_monitor"))
 
     def do_command_line(self, cmdline):
         options = cmdline.get_options_dict()
@@ -116,10 +117,9 @@ class Application(Adw.Application):
         self.devices = devices
         if self.window is not None:
             self.window.on_devices_changed(devices)
-        else:
+        elif self.autostart_enabled():
             for udid, dev in devices.items():
-                was_ready = udid in old and old[udid].state == READY
-                if dev.state == READY and not was_ready and not dev.fake:
+                if udid not in old and not dev.fake:
                     self.config.set_device(udid, name=dev.name)
                     if self.config.device(udid).get("open_on_connect", True):
                         self.activate()
@@ -132,6 +132,7 @@ class Application(Adw.Application):
             self.window = None
 
     def _quit(self):
+        self._quit_requested = True
         if self.window is not None:
             self.window.close()
             if self.window is not None:  # Nachfrage wegen laufendem Import
@@ -155,6 +156,7 @@ class Application(Adw.Application):
             if self._held:
                 self.release()
                 self._held = False
+        self.config.set("background_monitor", enabled)
 
 
 def main(argv=None):

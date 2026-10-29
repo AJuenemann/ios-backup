@@ -2,10 +2,10 @@
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
-from .dialogs import ask_text, confirm
+from .dialogs import ProgressDialog, alert, ask_text, confirm
 from .photogrid import PhotoGrid, Section
 from .util import (fmt_count, fmt_datetime, fmt_day, fmt_int, group_by_day, MONTHS,
-                   run_in_thread)
+                   idle, run_in_thread)
 
 MODES = [("years", "Jahre"), ("months", "Monate"), ("days", "Tage"), ("all", "Alle Fotos")]
 
@@ -15,6 +15,7 @@ SOURCES = {
     "live": ("Live Photos", {"kind": "live"}),
     "raw": ("RAW", {"raw": True}),
     "screenshots": ("Bildschirmfotos", {"screenshot": True}),
+    "hidden": ("Ausgeblendet", {"hidden": True}),
     "imports": ("Importe", {}),
 }
 
@@ -76,6 +77,7 @@ class LibraryView(Adw.NavigationPage):
         self.mode = "days" if source_id != "library" else win.config.get("library_mode") or "days"
         self._loaded_once = False
         self._focus_import = None
+        self._trashing = False
 
         self.toolbar = Adw.ToolbarView()
         self.set_child(self.toolbar)
@@ -99,6 +101,8 @@ class LibraryView(Adw.NavigationPage):
         menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=self.menu,
                                   tooltip_text="Weitere Optionen")
         header.pack_end(menu_btn)
+        header.pack_end(Gtk.Button(label="Alle auswählen", action_name="lib.select-all",
+                                   tooltip_text="Alle angezeigten Objekte auswählen (Strg+A)"))
         header.pack_end(win.make_zoom_scale())
         self.toolbar.add_top_bar(header)
 
@@ -129,16 +133,26 @@ class LibraryView(Adw.NavigationPage):
         self.stack.add_named(Adw.Spinner(), "loading")
         self.toolbar.set_content(self.stack)
 
+        selection = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8,
+                            margin_start=18, margin_end=18)
+        self.selection_label = Gtk.Label(xalign=0, hexpand=True)
+        selection.append(self.selection_label)
+        selection.append(Gtk.Button(label="In den Papierkorb …", action_name="lib.trash"))
+        self.selection_bar = Gtk.Revealer(child=selection)
+        self.toolbar.add_bottom_bar(self.selection_bar)
+
         group = Gio.SimpleActionGroup()
         for name, cb in (
             ("preview", lambda *_: self._preview()),
             ("open-external", lambda *_: self._open_external()),
             ("show-in-files", lambda *_: self._show_in_files()),
+            ("unhide", lambda *_: self._unhide()),
+            ("trash", lambda *_: self._trash_selected()),
             ("add-to-new-album", lambda *_: self._add_to_new_album()),
             ("remove-from-album", lambda *_: self._remove_from_album()),
             ("rename-album", lambda *_: self._rename_album()),
             ("delete-album", lambda *_: self._delete_album()),
-            ("select-all", lambda *_: self.grid.select_all()),
+            ("select-all", lambda *_: self.select_all()),
         ):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
@@ -148,6 +162,7 @@ class LibraryView(Adw.NavigationPage):
         group.add_action(add)
         self.actions = group
         self.insert_action_group("lib", group)
+        self._on_selection([])
         self.reload()
 
     # ------------------------------------------------------------- Daten
@@ -196,6 +211,7 @@ class LibraryView(Adw.NavigationPage):
         n = len(self.assets)
         self.window_title.set_subtitle(fmt_count(n))
         if not n:
+            self.grid.set_sections([])
             if self.source_id == "library":
                 self._show_empty("Noch keine Fotos",
                                  "Schließe dein iPhone per USB an, um Fotos und Videos zu importieren.")
@@ -315,8 +331,19 @@ class LibraryView(Adw.NavigationPage):
             self.banner.set_revealed(False)
 
     # ------------------------------------------------------------ Aktionen
+    def select_all(self):
+        if not self.assets:
+            return
+        if self.mode in ("years", "months"):
+            self._set_mode("all")
+        self.grid.select_all()
+
     def _on_selection(self, selected):
-        pass
+        n = len(selected)
+        self.selection_label.set_label(f"{fmt_count(n)} ausgewählt")
+        self.selection_bar.set_reveal_child(bool(n))
+        self.actions.lookup_action("trash").set_enabled(
+            bool(n) and not self._trashing and not self.win.is_busy())
 
     def _on_context(self, asset, x, y):
         menu = Gio.Menu()
@@ -324,7 +351,17 @@ class LibraryView(Adw.NavigationPage):
         first.append("Vorschau", "lib.preview")
         first.append("Mit Standardprogramm öffnen", "lib.open-external")
         first.append("Im Dateimanager zeigen", "lib.show-in-files")
+        first.append("In den Papierkorb …", "lib.trash")
+        if self.source_id == "hidden":
+            first.append("Einblenden", "lib.unhide")
         menu.append_section(None, first)
+        if self.source_id == "hidden":
+            pop = Gtk.PopoverMenu(menu_model=menu, has_arrow=False)
+            pop.set_parent(self.grid)
+            pop.set_pointing_to(self.win.rect(x, y))
+            pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+            pop.popup()
+            return
         albums = Gio.Menu()
         lib = self.win.library
         for al in lib.albums() if lib else []:
@@ -364,6 +401,99 @@ class LibraryView(Adw.NavigationPage):
         if cur:
             Gtk.FileLauncher.new(Gio.File.new_for_path(cur.primary.path)).open_containing_folder(
                 self.win, None, None)
+
+    def _unhide(self):
+        ids = self._ids()
+        if ids:
+            self.win.library.set_hidden(ids, False)
+            self.win.toast(f"{fmt_count(len(ids))} eingeblendet")
+            self.win.library_changed()
+            self.win.select_sidebar("library")
+
+    def _trash_selected(self):
+        ids = self._ids()
+        lib = self.win.library
+        if not ids or lib is None or self._trashing:
+            return
+        if self.win.is_busy():
+            self.win.toast("Bitte warte, bis der laufende Import abgeschlossen ist")
+            return
+
+        def trash(_checked):
+            if self.win.library is not lib or self.win.is_busy():
+                self.win.toast("Die Mediathek hat sich geändert oder ein Import läuft. Bitte erneut versuchen.")
+                return
+            self._trashing = True
+            self._on_selection(self.grid.selected)
+            progress = ProgressDialog(
+                "In den Papierkorb verschieben",
+                text=f"{fmt_count(len(ids))} werden vorbereitet …",
+            )
+            progress.cancel_button.set_tooltip_text(
+                "Stoppt nach dem aktuellen Objekt. Bereits verschobene Dateien bleiben im Papierkorb.")
+            self.trash_cancel = progress.cancel_event
+            progress.present(self.win)
+
+            def update(done, total, name):
+                if progress.cancel_event.is_set():
+                    progress.update(
+                        text="Wird nach dem aktuellen Objekt gestoppt …",
+                        detail=f"{fmt_int(done)} von {fmt_int(total)} Dateien bearbeitet",
+                    )
+                else:
+                    progress.update(
+                        fraction=done / total if total else 1,
+                        text=f"{fmt_int(done)} von {fmt_int(total)} Dateien bearbeitet",
+                        detail=f"{name}\nDatei wird verschoben; Index wird in Gruppen gespeichert. "
+                               "Bei langsamen Laufwerken kann dies dauern.",
+                    )
+
+            def finish():
+                self._trashing = False
+                progress.finish()
+                self.grid.clear_selection()
+                self.win.library_changed()
+                for view in self.win.import_views.values():
+                    view.reload()
+
+            def done(result):
+                completed, errors = result
+                finish()
+                if completed:
+                    self.win.toast(f"{fmt_count(completed)} in den Papierkorb verschoben")
+                if progress.cancel_event.is_set():
+                    self.win.toast("Vorgang gestoppt – bereits verschobene Dateien bleiben im Papierkorb")
+                if errors:
+                    details = "\n".join(f"• {name}: {message}" for name, message in errors[:10])
+                    if len(errors) > 10:
+                        details += f"\n… und {len(errors) - 10} weitere Fehler"
+                    alert(self.win, "Nicht alle Dateien verschoben",
+                          "Einige Dateien konnten nicht in den Papierkorb verschoben werden. "
+                          "Bereits verschobene Dateien liegen im System-Papierkorb; "
+                          "übrige Dateien bleiben in der Mediathek.\n\n" + details)
+
+            def failed(error):
+                finish()
+                alert(self.win, "Verschieben fehlgeschlagen", str(error))
+
+            run_in_thread(
+                lambda: lib.trash_assets(
+                    ids, progress=lambda *args: idle(update, *args), cancel=progress.cancel_event),
+                done, failed,
+            )
+
+        dialog = confirm(
+            self.win, f"{fmt_count(len(ids))} in den Papierkorb verschieben?",
+            "Die ausgewählten Objekte werden aus der lokalen Mediathek und allen Alben entfernt. "
+            "Alle zugehörigen Dateien, auch Live-Photo-Videos und Begleitdateien, werden in den "
+            "System-Papierkorb verschoben.\n\n"
+            "Mehrere Dateien werden dort in einem gemeinsamen Ordner mit ihrer bisherigen "
+            "Unterordnerstruktur abgelegt.\n\n"
+            "Die Originale auf dem iPhone bleiben unverändert. Nicht mehr lokal vorhandene "
+            "Objekte können beim nächsten Import erneut importiert werden.",
+            "In den Papierkorb", trash, destructive=True,
+        )
+        dialog.set_default_response("cancel")
 
     def _add_to_album(self, album_id):
         ids = self._ids()
@@ -413,4 +543,3 @@ class LibraryView(Adw.NavigationPage):
         confirm(self.win, f"Album „{self.album['name']}“ löschen?",
                 "Die Fotos bleiben in der Mediathek erhalten – nur das Album wird entfernt.",
                 "Löschen", delete, destructive=True)
-

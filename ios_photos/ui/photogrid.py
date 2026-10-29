@@ -128,7 +128,11 @@ class ThumbCell(Gtk.Widget):
         f = asset.display
         self.picture.set_paintable(None)
         self.placeholder.set_visible(True)
-        cb = self._on_texture
+        def cb(tex):
+            if self._texture_cb == (f, cb):
+                return self._on_texture(tex)
+            return False
+
         self._texture_cb = (f, cb)
         tex = self.grid.loader.request(f, cb)
         if tex is not None:
@@ -344,7 +348,7 @@ class PhotoGrid(Gtk.Widget):
 
     def do_size_allocate(self, width, height, baseline):
         self.scrolled.allocate(width, height, baseline, None)
-        if width != self._width:
+        if width != self._width or self._pending_scroll is not None:
             self._width = width
             self._queue_relayout()
 
@@ -395,6 +399,9 @@ class PhotoGrid(Gtk.Widget):
             if r.kind == "header" and r.section.key:
                 self._row_of_section.setdefault(r.section.key, i)
         self.store.splice(0, self.store.get_n_items(), rows)
+        # scroll_to vor der ersten Allokation lässt die ListView leer, bis gescrollt wird
+        if not self.get_mapped() or not self._width:
+            return False
         target = self._pending_scroll
         self._pending_scroll = None
         if rows:
@@ -449,11 +456,8 @@ class PhotoGrid(Gtk.Widget):
             a, b = sorted((self._pos[self.anchor], self._pos[key]))
             rng = {x.key for x in self.order[a:b + 1]}
             self.selected = (self.selected | rng) if ctrl else rng
-        elif ctrl:
-            self.selected ^= {key}
-            self.anchor = key
         else:
-            self.selected = {key}
+            self.selected ^= {key}
             self.anchor = key
         self.selection_updated()
 

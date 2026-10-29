@@ -1,6 +1,7 @@
 """Import-Ansicht für ein angeschlossenes iPhone – nach dem Vorbild von Apple Fotos."""
 
 import threading
+import time
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
@@ -34,9 +35,16 @@ class ImportView(Adw.NavigationPage):
         self.cancel_import = None
         self.cancel_load = threading.Event()
         self._album_ids = []
+        self._refreshing = False
+        self._loaded_at = 0.0
 
         self.toolbar = Adw.ToolbarView()
         self.set_child(self.toolbar)
+        self.toolbar.add_top_bar(Adw.Banner(
+            title="Kein Lösch-/Ausblendefilter: Alle über USB zugänglichen DCIM-Dateien "
+                  "können importiert werden, auch ausgeblendete oder zuletzt gelöschte.",
+            revealed=True,
+        ))
 
         # ---- Kopfzeile
         header = Adw.HeaderBar()
@@ -50,6 +58,8 @@ class ImportView(Adw.NavigationPage):
         menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=menu,
                                   tooltip_text="Weitere Optionen")
         header.pack_end(menu_btn)
+        header.pack_end(Gtk.Button(label="Alle auswählen", action_name="win.select-all",
+                                   tooltip_text="Alle angezeigten Objekte auswählen (Strg+A)"))
 
         self.filter_dd = Gtk.DropDown.new_from_strings([label for _, label in FILTERS])
         self.filter_dd.set_tooltip_text("Anzeigen")
@@ -158,12 +168,20 @@ class ImportView(Adw.NavigationPage):
         self.set_title(device.name)
         self.window_title.set_title(device.name)
         if device.state == READY:
-            if self.assets is None and not self.loading:
+            if self.assets is None and not self.loading and not self.importing:
                 self.load()
             elif self.assets is not None:
                 self._show_content()
         else:
-            self.assets = None if device.state != READY else self.assets
+            self.cancel_load.set()
+            self.loading = False
+            self.assets = None
+            self.grid.set_sections([])
+            if self.cancel_import and device.state != LOCKED:
+                self.cancel_import.set()
+            preview = getattr(self, "_device_preview", None)
+            if preview is not None:
+                preview.close()
             self._show_state(device.state, device.message)
         self._update_buttons()
 
@@ -224,19 +242,27 @@ class ImportView(Adw.NavigationPage):
         if self.device.state == READY:
             self.load()
 
+    def _scan(self, cancel, progress_scan=None, progress_meta=None):
+        assets = scan_dcim(self.device.mountpoint, progress=progress_scan, cancel=cancel)
+        if assets is None:
+            return None
+        lib = self.win.library
+        lib.mark_status(assets)
+        need = [a for a in assets if a.date is None]
+        apply_metadata(need, progress=progress_meta, cancel=cancel, cache=self.win.metacache)
+        return assets
+
     def load(self):
         if self.win.library is None:
             self._show_state("no-library")
             return
         self.loading = True
-        self.cancel_load.clear()
+        self.cancel_load.set()
+        self.cancel_load = threading.Event()
         self.loading_page.set_title("Fotos und Videos werden gelesen …")
         self.loading_page.set_description("")
         self.stack.set_visible_child_name("loading")
         self._update_buttons()
-        mountpoint = self.device.mountpoint
-        lib = self.win.library
-        cache = self.win.metacache
         cancel = self.cancel_load
 
         def progress_scan(n):
@@ -246,61 +272,88 @@ class ImportView(Adw.NavigationPage):
             idle(self.loading_page.set_description,
                  f"Aufnahmedaten werden gelesen: {fmt_int(done)} von {fmt_int(total)}")
 
-        def work():
-            assets = scan_dcim(mountpoint, progress=progress_scan)
-            if assets is None:
-                return None
-            lib.mark_status(assets)
-            need = [a for a in assets if a.date is None]
-            apply_metadata(need, progress=progress_meta, cancel=cancel, cache=cache)
-            return assets
+        run_in_thread(lambda: self._scan(cancel, progress_scan, progress_meta),
+                      lambda assets: not cancel.is_set() and self._loaded(assets),
+                      lambda err: not cancel.is_set() and self._load_failed(err))
 
-        run_in_thread(work, self._loaded, self._load_failed)
+    def refresh(self, force=False):
+        """Liest die Geräteliste im Hintergrund neu ein (Position und Auswahl bleiben)."""
+        if (self._refreshing or self.loading or self.importing or self.assets is None
+                or self.device.state != READY or self.win.library is None):
+            return
+        if not force and time.monotonic() - self._loaded_at < 20:
+            return
+        self._refreshing = True
+        cancel = self.cancel_load
 
-    def _loaded(self, assets):
+        def done(assets):
+            self._refreshing = False
+            if not cancel.is_set() and not self.importing:
+                self._loaded(assets, quiet=True)
+
+        def failed(_err):
+            self._refreshing = False
+
+        run_in_thread(lambda: self._scan(cancel), done, failed)
+
+    def _loaded(self, assets, quiet=False):
+        if self.device.state != READY or (quiet and self.importing):
+            return
         self.loading = False
         if assets is None:
             self._show_state(LOCKED)
             return
         self.assets = assets
-        self._show_content(scroll="top")
+        self._loaded_at = time.monotonic()
+        self._show_content(scroll=None if quiet else "top", quiet=quiet)
 
     def _load_failed(self, err):
         self.loading = False
         self._show_state(ERROR, str(err))
 
     # ---------------------------------------------------------- Darstellung
-    def _show_content(self, scroll=None):
+    def _show_content(self, scroll=None, quiet=False):
+        if self.device.state != READY:
+            self._show_state(self.device.state, self.device.message)
+            return
         if not self.assets:
             self._show_state("empty")
             self._update_buttons()
             return
         self.rebuild(scroll=scroll)
         self.stack.set_visible_child_name("grid")
-        GLib.idle_add(self.grid.grab_focus)
+        if not quiet:
+            GLib.idle_add(self.grid.grab_focus)
 
     def rebuild(self, scroll=None):
         if self.assets is None:
             return
         flt = [k for k, _ in FILTERS][self.filter_dd.get_selected()]
         hide = bool(self.win.config.get("hide_imported"))
-        shown = [a for a in self.assets if _match(a, flt)]
-        new = [a for a in shown if a.status == "new"]
-        old = [a for a in shown if a.status == "imported"]
+        visible = [a for a in self.assets if not a.extra.get("hidden")]
+        shown = [a for a in visible if _match(a, flt)]
+        new_active = [a for a in shown if a.status == "new"]
+        old_active = [a for a in shown if a.status == "imported"]
         sections = []
-        if new:
-            sections.append(Section("Neue Objekte", f"{fmt_count(len(new))} · {fmt_size(sum(a.size for a in new))}",
-                                    [], level=1, select_items=new, key="new"))
-            for day, items in group_by_day(new, descending=True):
+        if new_active:
+            sections.append(Section(
+                "Neue Objekte",
+                f"{fmt_count(len(new_active))} · {fmt_size(sum(a.size for a in new_active))}",
+                [],
+                level=1,
+                select_items=new_active,
+                key="new",
+            ))
+            for day, items in group_by_day(new_active, descending=True):
                 sections.append(Section(fmt_day(day), fmt_count(len(items)), items, key=f"new-{day}"))
         else:
             sections.append(Section("Keine neuen Objekte",
                                     "Alle Fotos und Videos auf diesem iPhone wurden bereits importiert.",
                                     [], level=1, selectable_header=False, key="new"))
-        if old and not hide:
-            sections.append(Section("Bereits importiert", fmt_count(len(old)), [], level=1,
-                                    select_items=old, key="old"))
-            for day, items in group_by_day(old, descending=True):
+        if old_active and not hide:
+            sections.append(Section("Bereits importiert", fmt_count(len(old_active)), [], level=1,
+                                    select_items=old_active, key="old"))
+            for day, items in group_by_day(old_active, descending=True):
                 sections.append(Section(fmt_day(day), fmt_count(len(items)), items, key=f"old-{day}"))
         self.grid.set_sections(sections, scroll=scroll)
         total_new = sum(1 for a in self.assets if a.status == "new")
@@ -396,7 +449,7 @@ class ImportView(Adw.NavigationPage):
         self.win.config.set_device(self.device.udid, open_on_connect=active, name=self.device.name)
         if active and not self.win.app.autostart_enabled():
             self.win.app.set_autostart(True)
-            self.win.toast("Die App wartet ab der nächsten Anmeldung im Hintergrund auf dein iPhone.")
+            self.win.toast("Die App wartet jetzt im Hintergrund auf dein iPhone, auch nach dem Anmelden.")
 
     def import_selected(self):
         sel = [a for a in self.grid.selected_assets() if a.status == "new"]
@@ -409,9 +462,12 @@ class ImportView(Adw.NavigationPage):
             self.start_import(new)
 
     def start_import(self, assets):
-        if self.importing or self.win.library is None:
+        if self.importing or self.win.library is None or self.device.state != READY:
             return
         self.importing = True
+        # Laufenden Hintergrund-Refresh abbrechen, damit er den Import-Stand nicht überschreibt.
+        self.cancel_load.set()
+        self.cancel_load = threading.Event()
         self.cancel_import = threading.Event()
         self.stop_btn.set_sensitive(True)
         self.prog_bar.set_fraction(0)
@@ -426,11 +482,21 @@ class ImportView(Adw.NavigationPage):
         def progress(done, total, done_b, total_b, name):
             idle(self._on_progress, done, total, done_b, total_b, name)
 
+        def source_waiting(name):
+            idle(self._on_source_waiting, name)
+
         def work():
             return run_import(lib, assets, album_id=album_id, udid=None if dev.fake else dev.udid,
-                              device_name=dev.name, cancel=cancel, progress=progress)
+                              device_name=dev.name, cancel=cancel, progress=progress,
+                              source_waiting=source_waiting)
 
         run_in_thread(work, self._import_done, self._import_failed)
+
+    def _on_source_waiting(self, name):
+        if self.importing and not self.cancel_import.is_set():
+            self.prog_label.set_label(
+                f"Kein Dateizugriff – bitte iPhone entsperren. "
+                f"Import wird automatisch fortgesetzt: {name}")
 
     def _on_progress(self, done, total, done_b, total_b, name):
         frac = done_b / total_b if total_b else (done / total if total else 1)
@@ -478,6 +544,10 @@ class ImportView(Adw.NavigationPage):
             self.win.toast("Import gestoppt")
         self.win.on_import_finished(self)
         self._update_buttons()
+        if result.failed and self.assets is not None:
+            self.refresh(force=True)
+        elif self.assets is None and self.device.state == READY:
+            self.load()
 
     def shutdown(self):
         self.cancel_load.set()

@@ -108,6 +108,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._install_actions()
         self.connect("close-request", self._on_close)
+        self.connect("notify::is-active", self._on_active)
         self.open_library()
         self.rebuild_sidebar()
         self.select_sidebar("library")
@@ -122,6 +123,7 @@ class MainWindow(Adw.ApplicationWindow):
             ("import-all", lambda *_: self._current_import_view() and self._current_import_view().import_all(),
              "<Control>i"),
             ("reload", lambda *_: self._reload_current(), "F5"),
+            ("select-all", lambda *_: self._select_all(), "<Control>a"),
         ):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
@@ -132,6 +134,13 @@ class MainWindow(Adw.ApplicationWindow):
     def _current_import_view(self):
         page = self.split.get_content()
         return page if isinstance(page, ImportView) else None
+
+    def _select_all(self):
+        page = self.split.get_content()
+        if isinstance(page, LibraryView):
+            page.select_all()
+        elif isinstance(page, ImportView) and page.stack.get_visible_child_name() == "grid":
+            page.grid.select_all()
 
     def _reload_current(self):
         page = self.split.get_content()
@@ -237,7 +246,8 @@ class MainWindow(Adw.ApplicationWindow):
             v.refresh_albums()
 
     def is_busy(self):
-        return any(v.importing for v in self.import_views.values())
+        return (any(v.importing for v in self.import_views.values())
+                or any(v._trashing for v in self.views.values()))
 
     def library_changed(self, reload_views=True):
         """Nach Import/Album-Änderungen: Seitenleiste und Ansichten aktualisieren."""
@@ -302,6 +312,8 @@ class MainWindow(Adw.ApplicationWindow):
             if counts.get(key):
                 rows.append(SidebarRow(rid, title, icon, "Medientypen", counts[key]))
         rows.append(SidebarRow("imports", "Importe", "folder-download-symbolic", "Alben"))
+        rows.append(SidebarRow("hidden", "Ausgeblendet", "view-conceal-symbolic", "Alben",
+                               counts.get("hidden")))
         for al in lib.albums() if lib else []:
             rows.append(SidebarRow(f"album:{al['id']}", al["name"], "folder-pictures-symbolic", "Alben",
                                    al["count"]))
@@ -367,6 +379,16 @@ class MainWindow(Adw.ApplicationWindow):
         if view is not None:
             self.split.set_content(view)
             self.split.set_show_content(True)
+            if row_id.startswith("device:") and view.assets is not None:
+                view.refresh()
+
+    def _on_active(self, *_args):
+        """Bei Rückkehr zum Fenster die Geräteansicht im Hintergrund aktualisieren."""
+        if not self.is_active():
+            return
+        page = self.split.get_content()
+        if isinstance(page, ImportView) and getattr(page, "_device_preview", None) is None:
+            page.refresh()
 
     def show_import(self, import_id):
         self.select_sidebar("imports")
@@ -438,10 +460,18 @@ class MainWindow(Adw.ApplicationWindow):
     def open_preview(self, assets, asset):
         if not assets:
             return
-        dlg = PreviewDialog(self, assets, asset)
         page = self.split.get_content()
+        if isinstance(page, ImportView) and page.device.state != READY:
+            return
+        dlg = PreviewDialog(self, assets, asset)
+        if isinstance(page, ImportView):
+            page._device_preview = dlg
 
         def closed(_d):
+            if isinstance(page, ImportView):
+                page._device_preview = None
+                if page.device.state != READY:
+                    return
             grid = getattr(page, "grid", None)
             if grid is not None:
                 cur = dlg.asset
@@ -460,11 +490,21 @@ class MainWindow(Adw.ApplicationWindow):
             def stop(_c):
                 for v in self.import_views.values():
                     v.shutdown()
+                for v in self.views.values():
+                    if v._trashing:
+                        v.trash_cancel.set()
                 GLib.timeout_add(300, self._really_close)
 
-            confirm(self, "Import läuft noch", "Soll der Import gestoppt und das Fenster geschlossen werden? "
-                    "Bereits importierte Objekte bleiben erhalten.", "Stoppen und schließen", stop,
+            dialog = confirm(self, "Dateivorgang läuft noch",
+                    "Vorgang nach der aktuellen Datei stoppen und das Fenster schließen? "
+                    "Bereits importierte Objekte bleiben erhalten; bereits verschobene Dateien "
+                    "bleiben im Papierkorb.", "Stoppen und schließen", stop,
                     destructive=True)
+            def response(_dialog, result):
+                if result != "ok":
+                    self.app._quit_requested = False
+
+            dialog.connect("response", response)
             return True
         self._cleanup()
         return False
@@ -474,6 +514,8 @@ class MainWindow(Adw.ApplicationWindow):
             return True
         self._cleanup()
         self.destroy()
+        if getattr(self.app, "_quit_requested", False):
+            self.app.quit()
         return False
 
     def _cleanup(self):

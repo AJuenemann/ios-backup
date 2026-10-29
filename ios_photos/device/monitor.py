@@ -1,10 +1,11 @@
 """Erkennung angeschlossener iPhones (libimobiledevice) und Einhängen per ifuse."""
 
 import os
+import errno
 import shutil
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..config import runtime_dir
 
@@ -79,6 +80,12 @@ def device_info(udid):
     return info
 
 
+def lock_state(udid):
+    # PasswordProtected meldet nur, ob ein Code eingerichtet ist – nicht, ob gerade gesperrt ist.
+    # Der tatsächliche Lesezugriff wird über den Mount-/DCIM-Check in _advance() entschieden.
+    return READY, ""
+
+
 def _model_name(product_type):
     if not product_type:
         return ""
@@ -94,9 +101,15 @@ def _fusermount():
 
 def is_mounted(path):
     try:
+        # ismount() selbst verschluckt Fehler eines abgerissenen FUSE-Mounts.
+        os.stat(path)
         return os.path.ismount(path)
-    except OSError:
-        return True  # „Transport endpoint is not connected“ → hängender Mount
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        if e.errno in (errno.EIO, errno.ENOTCONN):
+            return True
+        raise
 
 
 def unmount(path):
@@ -178,7 +191,7 @@ class DeviceMonitor:
         self._emit()
 
     def _emit(self):
-        self.on_change(dict(self.devices))
+        self.on_change({udid: replace(dev) for udid, dev in self.devices.items()})
 
     def _loop(self):
         while not self._stop.is_set():
@@ -207,29 +220,39 @@ class DeviceMonitor:
                 dev = self.devices[udid] = Device(udid)
                 changed = True
                 self._emit()
-            if dev.state == READY:
-                if dev.mountpoint and not os.path.isdir(os.path.join(dev.mountpoint, "DCIM")):
-                    dev.state, dev.message = LOCKED, ""
-                    changed = True
-                continue
-            changed |= self._advance(dev)
+            try:
+                changed |= self._advance(dev)
+            except OSError as e:
+                dev.state, dev.message = ERROR, str(e)
+                changed = True
         if changed:
             self._emit()
 
     def _advance(self, dev):
         before = (dev.state, dev.name, dev.message)
-        state, msg = pair_state(dev.udid)
+        if dev.state != READY:
+            state, msg = pair_state(dev.udid)
+            if state != READY:
+                dev.state, dev.message = state, msg
+                return before != (dev.state, dev.name, dev.message)
+        state, msg = lock_state(dev.udid)
+        if state != READY:
+            dev.state, dev.message = state, msg
+            return before != (dev.state, dev.name, dev.message)
+        if dev.state == READY and dev.mountpoint and os.path.isdir(os.path.join(dev.mountpoint, "DCIM")):
+            return False
         if state == READY:
             info = device_info(dev.udid)
             dev.name = info.get("DeviceName") or dev.name
             dev.model = _model_name(info.get("ProductType"))
             dev.ios = info.get("ProductVersion", "")
-            if not dev.mountpoint or not is_mounted(dev.mountpoint):
-                mp, err = mount(dev.udid)
-                if not mp:
-                    dev.state, dev.message = ERROR, err
-                    return before != (dev.state, dev.name, dev.message)
-                dev.mountpoint = mp
+            mp, err = mount(dev.udid)
+            if not mp:
+                locked = any(word in err.lower() for word in ("passwordprotected", "password protected",
+                                                              "passcode", "locked"))
+                dev.state, dev.message = (LOCKED if locked else ERROR), err
+                return before != (dev.state, dev.name, dev.message)
+            dev.mountpoint = mp
             if os.path.isdir(os.path.join(dev.mountpoint, "DCIM")):
                 dev.state, dev.message = READY, ""
             else:
